@@ -16,6 +16,9 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 const COMMAND_NAME = 'project-memory'
 const PLUGIN_ID = 'dsh-project-memory'
 
+/** Producer-owned source kind (see dsh/plugin.mjs -- "plugin" is not a valid kind). */
+const PRODUCER_KIND = `plugin:${PLUGIN_ID}`
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 /** Resolve the workspace root the same way the main plugin does. */
@@ -97,16 +100,18 @@ export function applySlashCommand(ctx, workspaceRoot) {
       const resolvedWorkspace = resolveWorkspace(sessionCwd ?? workspaceRoot)
       const hasMemory = resolvedWorkspace !== null && existsSync(join(resolvedWorkspace, 'AGENTS.md'))
 
-      // Parse flags from invocation text (e.g. "/project-memory --trace")
-      const rawText = typeof invocation.text === 'string' ? invocation.text : ''
-      const hasTraceFlag = /\b--trace\b/.test(rawText)
+      // Parse flags from invocation.rawInput (e.g. "/project-memory --trace")
+      const rawText = typeof invocation.rawInput === 'string' ? invocation.rawInput : ''
+      // `\b` never matches before `--` (a dash is not a word character), so the
+      // flag must be bounded by whitespace or the input edges.
+      const hasTraceFlag = /(?:^|\s)--trace(?:\s|$)/.test(rawText)
       const traceFlag = hasTraceFlag ? ' (retrieval trace enabled)' : ''
 
       const prompt = buildWorkflowPrompt(resolvedWorkspace ?? '', hasMemory, hasTraceFlag)
 
       invocation.agent.followup(createUserMessage({
         content: [{ type: 'text', text: prompt }],
-        source: { kind: 'plugin', plugin: PLUGIN_ID, form: 'instructions' },
+        source: { kind: PRODUCER_KIND, form: 'instructions' },
       }))
 
       const status = hasMemory ? 'audit & update' : 'initialize'

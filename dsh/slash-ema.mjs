@@ -17,6 +17,15 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm';
 const COMMAND_NAME = 'ema';
 const PLUGIN_ID = 'dsh-engineering-memory';
 
+/** Producer-owned source kind (see dsh/plugin.mjs -- "plugin" is not a valid kind). */
+const PRODUCER_KIND = `plugin:${PLUGIN_ID}`
+
+/** `--trace` selector. `\b` never matches before `--` (a dash is not a word
+ * character), so the flag is bounded by whitespace or the input edges instead. */
+const TRACE_FLAG = /(?:^|\s)--trace(?:\s|$)/;
+/** Ephemeral retrieval-trace instruction appended when `--trace` is present. */
+const TRACE_NOTE = '\n\n**Retrieval Trace Mode:** Record every knowledge retrieval step in a trace object.\nLog each step as it happens. Include query, route taken, confidence, and final unit.\nPrint the trace at the end of the report under "## Retrieval Trace". Do not persist this trace to any file.';
+
 /**
  * Parses user input string into subcommand and arguments.
  * @param {string} text
@@ -127,16 +136,19 @@ export function applyEmaSlashCommand(ctx, workspaceRoot) {
     name: COMMAND_NAME,
     description: 'Engineering Memory Agent: recall, verify, promote, or inspect memory status',
     handler(invocation) {
-      const rawText = typeof invocation.text === 'string' ? invocation.text : '';
-      const { subcommand, args } = parseEmaCommand(rawText);
+      const rawText = typeof invocation.rawInput === 'string' ? invocation.rawInput : '';
+      const traceEnabled = TRACE_FLAG.test(rawText);
+      // `--trace` selects a trace; it is never part of the search query.
+      const { subcommand, args } = parseEmaCommand(rawText.replace('--trace', ' '));
       const sessionCwd = invocation.agent?.session?.header?.cwd || workspaceRoot || process.cwd();
 
-      const prompt = buildEmaPrompt(subcommand, args, sessionCwd);
+      const basePrompt = buildEmaPrompt(subcommand, args, sessionCwd);
+      const prompt = traceEnabled ? basePrompt + TRACE_NOTE : basePrompt;
 
       if (invocation.agent && typeof invocation.agent.followup === 'function') {
         invocation.agent.followup(createUserMessage({
           content: [{ type: 'text', text: prompt }],
-          source: { kind: 'plugin', plugin: PLUGIN_ID, form: 'instructions' },
+          source: { kind: PRODUCER_KIND, form: 'instructions' },
         }));
       }
 

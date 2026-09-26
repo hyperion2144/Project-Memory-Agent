@@ -22,9 +22,8 @@
  *      automatic Project Memory workflow without selecting an Agent preset.
  *
  * Events listened to (best-effort, never throws into the harness loop):
- *   - agent/pre-step    -> inject first-time-init hint (once per agent)
- *   - agent/post-step   -> inject post-task compounding prompt (opt-in)
- *   - session/start     -> inject freshness warning if pending_updates > 0
+ *   - agent/pre-step      -> static context, freshness warning, first-time-init hint
+ *   - agent/turn-stopping -> post-task compounding prompt (opt-in: COMPOUNDING_ENABLED)
  */
 
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
@@ -32,12 +31,23 @@ import { readFile } from 'node:fs/promises'
 import { join, relative, dirname } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { homedir } from 'node:os'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { cbmApply, getOrCreateClient } from './codebase-memory-bridge.mjs'
 import { applySlashCommand } from './slash-project-memory.mjs'
 import { applyEmaSlashCommand } from './slash-ema.mjs'
 import { handleUIRequest, startUIServer } from '../src/ui/server.mjs'
 
 const PLUGIN_ID = 'dsh-project-memory'
+
+/**
+ * Producer-owned message source kind.
+ *
+ * The session protocol has no catch-all "plugin" kind: every producer declares its
+ * own, and a third-party plugin's is `plugin:<name>` -- which is exactly what DSH's
+ * own v3-to-v4 migration rewrites a legacy `{ kind: 'plugin', plugin: <name> }`
+ * source into. `form` must be a declared ContextForm value ('context' is not one).
+ */
+const PRODUCER_KIND = `plugin:${PLUGIN_ID}`
 
 /** Path to this plugin's own source -- used to resolve skills/ relative to the repo. */
 const PLUGIN_ROOT = dirname(fileURLToPath(import.meta.url))
@@ -160,10 +170,12 @@ function extractText(content) {
  * an explicit project cwd), so the caller can skip init-hint injection. */
 function resolveWorkspace(payload) {
   const candidates = [
-    payload?.cwd,
-    payload?.agent?.cwd,
+    // The session header is the authoritative workspace, and the only candidate
+    // present on an `agent/pre-step` payload (which carries just the agent).
+    payload?.agent?.session?.header?.cwd,
     payload?.session?.header?.cwd,
-    payload?.session?.cwd,
+    payload?.agent?.cwd,
+    payload?.cwd,
     process.cwd(),
   ].filter(c => typeof c === 'string' && c.trim())
   for (const c of candidates) {
@@ -288,11 +300,27 @@ function buildInitHint(workspaceRoot) {
 
 // ── Post-Task Compounding ─────────────────────────────────────────────────────
 
-/** Check whether post-task compounding is enabled. */
+/** Post-task compounding injection is opt-in: it runs only when COMPOUNDING_ENABLED
+ * is set to something other than 0 / false / off. */
 function isCompoundingEnabled() {
   const env = process.env.COMPOUNDING_ENABLED
-  if (env === undefined) return true  // default on
+  if (env === undefined) return false
   return env !== '0' && env !== 'false' && env !== 'off'
+}
+
+/** Last human-authored user text of the session, read from the session's derived
+ * history. Producer-injected context (any `plugin:*` source) is skipped, so this
+ * plugin's own injections are never mistaken for the user's task. */
+function lastHumanText(agent) {
+  const messages = agent?.session?.deriveMessages?.() ?? []
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]
+    if (message?.role !== 'user') continue
+    const kind = message?.source?.kind
+    if (typeof kind === 'string' && kind.startsWith('plugin:')) continue
+    return extractText(message.content)
+  }
+  return ''
 }
 
 /** Build the post-task compounding prompt. */
@@ -536,12 +564,10 @@ export function apply(ctx, config = {}) {
             const staticCtx = buildStaticContext(workspace, 500)
             if (staticCtx && typeof agent?.inject === 'function') {
               contextInjected.add(agent)
-              agent.inject({
-                id: crypto.randomUUID(),
-                role: 'user',
+              agent.inject(createUserMessage({
                 content: [{ type: 'text', text: staticCtx }],
-                source: { kind: 'plugin', plugin: PLUGIN_ID, form: 'context' },
-              })
+                source: { kind: PRODUCER_KIND, form: 'instructions' },
+              }))
               console.log(`[project-memory] injected L0 static context (< 500 tokens) for ${workspace}`)
             }
           }
@@ -550,12 +576,10 @@ export function apply(ctx, config = {}) {
           if (workspace) {
             const freshnessWarning = buildFreshnessWarning(workspace)
             if (freshnessWarning && typeof agent?.inject === 'function') {
-              agent.inject({
-                id: crypto.randomUUID(),
-                role: 'user',
+              agent.inject(createUserMessage({
                 content: [{ type: 'text', text: freshnessWarning }],
-                source: { kind: 'plugin', plugin: PLUGIN_ID, form: 'instructions' },
-              })
+                source: { kind: PRODUCER_KIND, form: 'instructions' },
+              }))
               console.log(`[project-memory] injected freshness warning for ${workspace}`)
             }
           }
@@ -564,12 +588,10 @@ export function apply(ctx, config = {}) {
           if (workspace && needsInit(workspace) && agent && !initHinted.has(agent)) {
             initHinted.add(agent)
             if (typeof agent?.inject === 'function') {
-              agent.inject({
-                id: crypto.randomUUID(),
-                role: 'user',
+              agent.inject(createUserMessage({
                 content: [{ type: 'text', text: buildInitHint(workspace) }],
-                source: { kind: 'plugin', plugin: PLUGIN_ID, form: 'instructions' },
-              })
+                source: { kind: PRODUCER_KIND, form: 'instructions' },
+              }))
               console.log(`[project-memory] injected first-time-init hint for ${workspace}`)
             }
           }
@@ -583,10 +605,13 @@ export function apply(ctx, config = {}) {
       // event bus missing -- plugin still works (skills are registered above)
     }
 
-    // Listen for agent/post-step to inject post-task compounding prompt.
+    // Listen for agent/turn-stopping to inject the post-task compounding prompt.
+    // (`agent/post-step` does not exist on DSH 0.1.7; turn-stopping is the
+    // agent-scoped turn-ending event, and the task text comes from the session's
+    // derived history rather than the retired payload message field.)
     if (isCompoundingEnabled()) {
       try {
-        on('agent/post-step', (payload, next) => {
+        on('agent/turn-stopping', (payload) => {
           try {
             const workspace = resolveWorkspace(payload)
             const agent = payload?.agent ?? payload
@@ -594,31 +619,25 @@ export function apply(ctx, config = {}) {
             // Only inject once per agent per session
             if (!workspace || !agent || compoundHinted.has(agent)) return
 
-            // Check if the last user message suggests substantial work was done
-            const lastMsg = payload?.lastMessage ?? payload?.message
-            const lastText = extractText(lastMsg?.content ?? lastMsg)
+            // Did a substantial human task just finish?
+            const lastText = lastHumanText(agent)
             const isSubstantialTask =
               lastText.length > 50 &&
-              !lastText.startsWith('/project-memory') &&
-              !lastText.startsWith('Project Memory')
+              !lastText.startsWith('/project-memory')
 
             if (isSubstantialTask) {
               compoundHinted.add(agent)
               if (typeof agent?.inject === 'function') {
-                agent.inject({
-                  id: crypto.randomUUID(),
-                  role: 'user',
+                agent.inject(createUserMessage({
                   content: [{ type: 'text', text: buildCompoundingPrompt(workspace, lastText) }],
-                  source: { kind: 'plugin', plugin: PLUGIN_ID, form: 'instructions' },
-                })
+                  source: { kind: PRODUCER_KIND, form: 'instructions' },
+                }))
                 console.log(`[project-memory] injected post-task compounding prompt for ${workspace}`)
               }
             }
           } catch {
             // best-effort
           }
-          if (typeof next === 'function') return next()
-          return undefined
         })
       } catch {
         // event bus missing post-step -- plugin still works
