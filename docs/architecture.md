@@ -51,7 +51,10 @@ any DSH profile via Cordis. install.ps1 also seeds `project-memory.md` into
 
 ```
 dsh-plugin/
-  package.json              -> declares @deepseek-ai/dsh-llm dep; peerDep on @deepseek-ai/cordis
+  package.json              -> host core packages are peers ONLY (@deepseek-ai/dsh-llm,
+                              dsh-skill, dsh-tools, cordis); never dependencies, because a
+                              hoisted copy would shadow the host's own (see
+                              docs/lessons/host-core-packages-are-peers.md)
   cordis.patch.yml          -> two-row Cordis patch (pma-skill-dir insert + project-memory-dsh)
   dsh/plugin.mjs            -> real logic: skill mount, lifecycle hooks, cbm_* tools
   lib/index.js              -> deliberate no-op stub (empty inject array). All behavior

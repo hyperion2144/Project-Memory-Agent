@@ -249,3 +249,159 @@ project directory will still get the init hint as expected.
 
 - npm: `@lovedolove/dsh-project-memory@0.4.5`
 - Commit: `40e8819`
+
+---
+
+## Bug 6: Retired `plugin` Message Source Kind (Unreleased)
+
+### Problem
+
+With the package-shadowing bug fixed (issue #1), `dsh` booted cleanly and the plugin loaded —
+but **any conversation failed immediately**:
+
+```
+format v4 message requires a producer-owned source kind
+```
+
+The plugin had to be uninstalled to use DSH at all.
+
+### Root Cause
+
+Every injected message declared the same invented source:
+
+```javascript
+source: { kind: 'plugin', plugin: PLUGIN_ID, form: 'instructions' }
+```
+
+Session format v4 has **no catch-all `plugin` kind**. Each producer declares its own, and
+admission refuses the retired value — `dsh-session-format-v3-to-v4` rejects `kind === "plugin"`
+outright. The protocol's own migration states the canonical rule; `producerKind()` maps an
+unknown plugin to `plugin:<plugin>` and drops the `plugin` field:
+
+```javascript
+function producerKind(plugin, role) {
+  // ... rename tables for first-party producers ...
+  return `plugin:${plugin}`
+}
+```
+
+The static-context injection additionally used `form: 'context'`, which is not a member of the
+protocol's `ContextForm` union.
+
+### Fix
+
+```javascript
+// Before -- hand-rolled message, invented source
+agent.inject({
+  id: crypto.randomUUID(),
+  role: 'user',
+  content: [{ type: 'text', text }],
+  source: { kind: 'plugin', plugin: PLUGIN_ID, form: 'context' },
+})
+
+// After -- the host's own factory, and the kind DSH's migration would produce
+agent.inject(createUserMessage({
+  content: [{ type: 'text', text }],
+  source: { kind: `plugin:${PLUGIN_ID}`, form: 'instructions' },
+}))
+```
+
+All six injection sites — four lifecycle hooks in `dsh/plugin.mjs` and both slash commands — now
+use the host's `createUserMessage()`, which is reachable as a peer package through DSH's shared
+core layer (see `docs/lessons/host-core-packages-are-peers.md`).
+
+### Evidence
+
+- Validator replay with the host's own `assertV4RowAdmission`:
+  `{ kind: 'plugin', ... }` → REFUSE `format v4 message requires a producer-owned source kind`;
+  `{ kind: 'plugin:dsh-project-memory', ... }` → ACCEPT.
+- `test/integration/dsh-plugin-hooks.test.mjs` asserts the contract on every injected message.
+- Issue: [#1](https://github.com/hyperion2144/Project-Memory-Agent/issues/1) (same install-and-boot session).
+
+---
+
+## Bug 7: Host-API Drift Against DSH 0.1.7-rc.2 (Unreleased)
+
+### Problem
+
+After the boot-breaking bugs were fixed, a systematic sweep of every host contract the
+plugin binds to found three further mismatches. None of them crash — all three fail
+**silently**, which is why they survived:
+
+1. `/ema recall …`, `/ema status`, `/ema verify`, `/ema promote` all behaved as the plain
+   `default` subcommand, and `/project-memory --trace` never enabled tracing.
+2. The post-task compounding prompt (the plugin's `agent/post-step` hook) never fired.
+3. Hook-driven context injection resolved its workspace from `process.cwd()` instead of the
+   session's workspace.
+
+### Root Cause
+
+**1) `invocation.text` does not exist.** `CommandInvocation` carries `rawInput` (the text
+after the command name, including separator whitespace), and nothing else. Both slash
+commands read `invocation.text`, got `undefined`, and fell back to `''`.
+
+```javascript
+// Before -- field absent, value always undefined
+const rawText = typeof invocation.text === 'string' ? invocation.text : ''
+// After
+const rawText = typeof invocation.rawInput === 'string' ? invocation.rawInput : ''
+```
+
+Underneath it sat a second defect: the flag regex could never match. `\b` asserts a word
+boundary, and `-` is not a word character, so `\b--trace\b` is false for every realistic
+input — including `/project-memory --trace`:
+
+```javascript
+// Before -- false for ' --trace', '/project-memory --trace', '--trace'
+const hasTraceFlag = /\b--trace\b/.test(rawText)
+// After
+const hasTraceFlag = /(?:^|\s)--trace(?:\s|$)/.test(rawText)
+```
+
+`/ema recall --trace` was documented but never implemented, and the flag was joined into the
+search query verbatim (searching for the literal `--trace`). It is now consumed as a
+selector and answered with the same ephemeral trace instruction as `/project-memory --trace`.
+
+**2) `agent/post-step` does not exist on DSH 0.1.7-rc.2.** The declared agent events are
+`agent/pre-step`, `agent/request`, `agent/turn-stopping`, `agent/status`, `agent/created`,
+`agent/disposed`, `agent/error`, `agent/request-error`, `agent/assistant-stream`. The hook was
+registered on a name nothing emits, so the feature was dead code (and the payload field it
+read, `payload.lastMessage`, does not exist either).
+
+The port uses `agent/turn-stopping` — the agent-scoped turn-ending event that still carries
+the agent — and reads the task text from `session.deriveMessages()`, skipping any message
+whose source is a `plugin:*` producer so the plugin's own injections are not mistaken for the
+user's task:
+
+```javascript
+on('agent/turn-stopping', (payload) => {
+  const lastText = lastHumanText(payload?.agent)   // session.deriveMessages(), human sources only
+  …
+})
+```
+
+It is also **opt-in** now (`COMPOUNDING_ENABLED`), matching the contract the file header
+always claimed; the old code defaulted to on while the hook never ran.
+
+**3) The `agent/pre-step` payload carries no `cwd`.** It is
+`{ agent, messages, turn, step, signal }`. `resolveWorkspace()` probed `payload.session` and
+`payload.agent.cwd`, neither of which exists, so every hook-driven injection fell through to
+`process.cwd()` — the directory DSH was launched from, not the agent's workspace. The
+authoritative value is `payload.agent.session.header.cwd` (`SessionHeader.cwd`), now probed
+first.
+
+### Verified compatible (no change needed)
+
+`CommandResult` (`{ kind: 'success', text? }`), the `agent/pre-step` waterfall including its
+`next()` contract, `ctx.skills.register` / `ctx.skills.registerProvider`, `defineTool` options
+and `ctx.tools.register`, `WebRoute { kind: 'prefix', path, handler }`, `agent.inject` /
+`agent.followup`, and `agent.session.header.cwd`.
+
+### Evidence
+
+- `test/integration/dsh-plugin-hooks.test.mjs` covers all three: `rawInput` subcommand parsing,
+  opt-in `agent/turn-stopping` compounding, and a workspace marker that only the session cwd
+  carries (a `process.cwd()` fallback cannot satisfy it).
+- The `--trace` regex defect is demonstrated by `/\b--trace\b/.test(' --trace') === false`.
+- Issues: [#1](https://github.com/hyperion2144/Project-Memory-Agent/issues/1),
+  [#2](https://github.com/hyperion2144/Project-Memory-Agent/issues/2) — same install session.
